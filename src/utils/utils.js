@@ -8,18 +8,98 @@ function generateCursorBody(messages, modelName) {
 
   const instruction = messages
     .filter(msg => msg.role === 'system')
-    .map(msg => msg.content)
+    .map(msg => {
+      // 处理system消息的content，可能是字符串或数组
+      if (typeof msg.content === 'string') {
+        return msg.content;
+      } else if (Array.isArray(msg.content)) {
+        // 如果是数组，提取所有text类型的内容
+        return msg.content
+          .filter(item => item.type === 'text')
+          .map(item => item.text)
+          .join('\n');
+      }
+      return '';
+    })
     .join('\n')
 
   const formattedMessages = messages
     .filter(msg => msg.role !== 'system')
-    .map(msg => ({
-      content: msg.content,
-      role: msg.role === 'user' ? 1 : 2,
-      messageId: uuidv4(),
-      ...(msg.role === 'user' ? { chatModeEnum: 1 } : {})
-      //...(msg.role !== 'user' ? { summaryId: uuidv4() } : {})
-    }));
+    .map(msg => {
+      const baseMessage = {
+        role: msg.role === 'user' ? 1 : 2,
+        messageId: uuidv4(),
+        ...(msg.role === 'user' ? { chatModeEnum: 1 } : {})
+        //...(msg.role !== 'user' ? { summaryId: uuidv4() } : {})
+      };
+
+      // 处理content，支持OpenAI格式的图片消息
+      if (typeof msg.content === 'string') {
+        // 简单的字符串内容
+        baseMessage.content = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        // OpenAI格式的多模态内容
+        let textContent = '';
+        let imageData = null;
+        let imageMetadata = null;
+
+        for (const item of msg.content) {
+          if (item.type === 'text') {
+            textContent += item.text;
+          } else if (item.type === 'image_url') {
+            // 处理图片URL
+            const imageUrl = item.image_url.url;
+            if (imageUrl.startsWith('data:image/')) {
+              // Base64编码的图片
+              const [header, base64Data] = imageUrl.split(',');
+              const mimeType = header.match(/data:image\/([^;]+)/)?.[1];
+              
+              if (base64Data && mimeType) {
+                try {
+                  // 将base64转换为buffer
+                  const buffer = Buffer.from(base64Data, 'base64');
+                  imageData = buffer;
+                  
+                  // 尝试从图片数据中获取尺寸信息（简单的JPEG/PNG检测）
+                  let width = 0, height = 0;
+                  if (mimeType === 'jpeg' || mimeType === 'jpg') {
+                    // 简单的JPEG尺寸检测
+                    const dimensions = getJPEGDimensions(buffer);
+                    width = dimensions.width;
+                    height = dimensions.height;
+                  } else if (mimeType === 'png') {
+                    // 简单的PNG尺寸检测
+                    const dimensions = getPNGDimensions(buffer);
+                    width = dimensions.width;
+                    height = dimensions.height;
+                  }
+                  
+                  imageMetadata = {
+                    width: width || 1024,  // 默认尺寸
+                    height: height || 1024
+                  };
+                } catch (error) {
+                  console.error('处理图片数据失败:', error);
+                }
+              }
+            }
+          }
+        }
+
+        baseMessage.content = textContent;
+        if (imageData && imageMetadata) {
+          baseMessage.image = {
+            data: imageData,
+            metadata: imageMetadata
+          };
+        }
+      } else {
+        // 其他类型，转换为字符串
+        baseMessage.content = String(msg.content || '');
+      }
+
+      return baseMessage;
+    });
 
   const messageIds = formattedMessages.map(msg => {
     const { role, messageId, summaryId } = msg;
@@ -196,6 +276,50 @@ function generateCursorChecksum(token) {
   const encodedChecksum = Buffer.from(obfuscatedBytes).toString('base64');
 
   return `${encodedChecksum}${machineId}/${macMachineId}`;
+}
+
+// 简单的JPEG尺寸检测
+function getJPEGDimensions(buffer) {
+  try {
+    let offset = 2; // 跳过SOI标记
+    while (offset < buffer.length) {
+      const marker = buffer.readUInt16BE(offset);
+      offset += 2;
+      
+      if (marker >= 0xFFC0 && marker <= 0xFFC3) {
+        // SOF (Start of Frame) 标记
+        offset += 3; // 跳过长度和精度
+        const height = buffer.readUInt16BE(offset);
+        const width = buffer.readUInt16BE(offset + 2);
+        return { width, height };
+      }
+      
+      if (marker === 0xFFD9) break; // EOI标记
+      
+      const length = buffer.readUInt16BE(offset);
+      offset += length;
+    }
+  } catch (error) {
+    // 解析失败，返回默认值
+  }
+  return { width: 1024, height: 1024 };
+}
+
+// 简单的PNG尺寸检测
+function getPNGDimensions(buffer) {
+  try {
+    // PNG文件的IHDR chunk在文件开头的固定位置
+    if (buffer.length >= 24 && 
+        buffer.readUInt32BE(0) === 0x89504E47 && // PNG签名
+        buffer.readUInt32BE(4) === 0x0D0A1A0A) {
+      const width = buffer.readUInt32BE(16);
+      const height = buffer.readUInt32BE(20);
+      return { width, height };
+    }
+  } catch (error) {
+    // 解析失败，返回默认值
+  }
+  return { width: 1024, height: 1024 };
 }
 
 module.exports = {
